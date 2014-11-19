@@ -8,7 +8,6 @@ var os = require('os');
 var packet = require('./packet');
 
 var port = 56700;
-
 var debug = false;
 
 function init() {
@@ -22,7 +21,7 @@ function init() {
 function Lifx() {
 	events.EventEmitter.call(this);
 	this.gateways = [];
-	this.bulbs = [];
+	this.bulbs = {};
 	this.udpClient = dgram.createSocket("udp4");
 	this._intervalID = null;
 	this._localIPs = getMyIPs();
@@ -34,10 +33,14 @@ Lifx.prototype.__proto__ = events.EventEmitter.prototype;
 
 Lifx.prototype._initNetwork = function() {
 	var self = this;
+
+    // Setup an error handler
 	this.udpClient.on("error", function (err) {
 		console.error("*** UDP error " + err);
 		self.emit('error', err);
 	});
+
+    // Setup message handler
 	this.udpClient.on("message", function (msg, rinfo) {
 		// Check it didn't come from us
 		if (self._localIPs.indexOf(rinfo.address) > -1) {
@@ -47,6 +50,8 @@ Lifx.prototype._initNetwork = function() {
 		var pkt = packet.fromBytes(msg);
 		self.emit('rawpacket', pkt, rinfo);
 	});
+
+    // bind the client to localhost in broadcast mode
 	this.udpClient.bind(port, "0.0.0.0", function() {
 		self.udpClient.setBroadcast(true);
 		self.emit('ready');
@@ -55,8 +60,7 @@ Lifx.prototype._initNetwork = function() {
 
 Lifx.prototype._sendPacket = function(dstIp, dstPort, packet) {
 	if (debug) console.log(" U+ " + packet.toString("hex"));
-	this.udpClient.send(packet, 0, packet.length, dstPort, dstIp, function(err, bytes) {
-	});
+	this.udpClient.send(packet, 0, packet.length, dstPort, dstIp, function(err, bytes) { });
 }
 
 Lifx.prototype.startDiscovery = function(interval) {
@@ -98,23 +102,11 @@ Lifx.prototype._setupPacketListener = function() {
 			case 'lightStatus':
 				// Got a notification of a light's status.  Check if it's a new light, and handle it accordingly.
 				var bulb = {addr:pkt.preamble.bulbAddress, name:pkt.payload.bulbLabel};
-				var found = false;
-				for (var i in self.bulbs) {
-					if (self.bulbs[i].addr == bulb.addr) {
-						found = true;
-						break;
-					}
-				}
-				if (!found) {
-					self.bulbs.push(bulb);
-					self.emit('bulb', bulb);
-				}
-
+                // Add it to the bulbMap if not present
+                if (!self.bulbs[bulb.addr]) { self.bulbs[bulb.name] = bulb; self.emit('bulb', bulb); }
 				// Even if it's not new, emit updated info about the state of the bulb
 				self.emit('bulbstate', bulb);
-
 				break;
-
 			default:
 				console.log('Unhandled packet of type ['+pkt.packetTypeShortName+']');
 				console.log(pkt.payload);
