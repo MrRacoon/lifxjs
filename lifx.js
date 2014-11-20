@@ -10,6 +10,8 @@ var packet = require('./packet');
 var port = 56700;
 var debug = false;
 
+var logit = function (str) { if (debug) console.log(str); }
+
 function init() {
 	var l = new Lifx();
 	l.on('ready', function() {
@@ -20,7 +22,7 @@ function init() {
 
 function Lifx() {
 	events.EventEmitter.call(this);
-	this.gateways = [];
+	this.gateways = {};
 	this.bulbs = {};
 	this.udpClient = dgram.createSocket("udp4");
 	this._intervalID = null;
@@ -29,16 +31,24 @@ function Lifx() {
 	this._setupPacketListener();
 	this._setupGatewayListener();
 }
+
+var emitMsg = {
+    ready      : 'ready'    // Signals that the netwoork is setup
+    , bulbState: 'bulbState'//
+    , bulb     : 'bulb'     //
+    , rawPacket: 'rawpacket'// Trigger the Packet listener
+    , gateway  : 'gateway'  // Trigger the gateway Listener
+}
+
 Lifx.prototype.__proto__ = events.EventEmitter.prototype;
 
 Lifx.prototype._initNetwork = function() {
+
+    // Link to this
 	var self = this;
 
     // Setup an error handler
-	this.udpClient.on("error", function (err) {
-		console.error("*** UDP error " + err);
-		self.emit('error', err);
-	});
+	this.udpClient.on("error", function (err) { console.error("*** UDP error " + err); self.emit('error', err); });
 
     // Setup message handler
 	this.udpClient.on("message", function (msg, rinfo) {
@@ -52,10 +62,8 @@ Lifx.prototype._initNetwork = function() {
 	});
 
     // bind the client to localhost in broadcast mode
-	this.udpClient.bind(port, "0.0.0.0", function() {
-		self.udpClient.setBroadcast(true);
-		self.emit('ready');
-	});
+	this.udpClient.bind(port, "0.0.0.0", function() { self.udpClient.setBroadcast(true); self.emit(emitMsg.ready); });
+
 }
 
 Lifx.prototype._sendPacket = function(dstIp, dstPort, packet) {
@@ -75,53 +83,44 @@ Lifx.prototype.stopDiscovery = function() {
 	clearInterval(this._intervalID);
 };
 
+/**
+ *  Packet Listener
+ *
+ *  When a familiar packet is seen deal with it
+ */
 Lifx.prototype._setupPacketListener = function() {
 	var self = this;
 
-	this.on('rawpacket', function(pkt, rinfo) {
+    var __addGateway (gw) {
+        self.gateways[gw.ip] = gw;
+        self.emit(emitMsg.gateway, gw);
+    };
+
+	this.on(emitMsg.rawPacket, function(pkt, rinfo) {
 		switch (pkt.packetTypeShortName) {
-
-			case 'panGateway':
-				// Got a notification of a gateway.  Check if it's new, using valid UDP, and if it is then handle accordingly
-				if (pkt.payload.service == 1 && pkt.payload.port > 0) {
-					var gw = {ip:rinfo.address, port:pkt.payload.port, site:pkt.preamble.site};
-					var found = false;
-					for (var i in self.gateways) {
-						if (self.gateways[i].ip == gw.ip && self.gateways[i].port == gw.port) {
-							found = true;
-							break;
-						}
-					}
-					if (!found) {
-						self.gateways.push(gw);
-						self.emit('gateway', gw);
-					}
-				}
+			case 'panGateway': // Got a notification of a gateway.  Check if it's new, using valid UDP, and if it is then handle accordingly
+				if (pkt.payload.service != 1 || pkt.payload.port <= 0) break;
+                var gw = {ip:rinfo.address, port:pkt.payload.port, site:pkt.preamble.site};
+                if (!self.gateways[gw.ip] || self.gateways[gw.ip].port != gw.port) __addGateway(gw);
 				break;
-
-			case 'lightStatus':
-				// Got a notification of a light's status.  Check if it's a new light, and handle it accordingly.
+			case 'lightStatus': // Got a notification of a light's status.  Check if it's a new light, and handle it accordingly.
 				var bulb = {addr:pkt.preamble.bulbAddress, name:pkt.payload.bulbLabel};
-                // Add it to the bulbMap if not present
-                if (!self.bulbs[bulb.addr]) { self.bulbs[bulb.name] = bulb; self.emit('bulb', bulb); }
-				// Even if it's not new, emit updated info about the state of the bulb
-				self.emit('bulbstate', bulb);
+                if (!self.bulbs[bulb.addr]) { self.bulbs[bulb.name] = bulb; self.emit(emitMsg.bulb, bulb); }
+				self.emit(emitMsg.bulbstate, bulb);
 				break;
 			default:
-				console.log('Unhandled packet of type ['+pkt.packetTypeShortName+']');
-				console.log(pkt.payload);
+				logIt('Unhandled packet of type ['+pkt.packetTypeShortName+']');
+				logIt(pkt.payload);
 				break;
 		}
 	});
-
 };
 
 Lifx.prototype._setupGatewayListener = function() {
 	var self = this;
-	self.on('gateway', function(gw) {
+	self.on(emitMsg.gateway, function(gw) {
 		// Ask the gateway for new bulbs
 		self._sendPacket(gw.ip, gw.port, packet.getLightState({site:gw.site}));
-
 		// Also slow down the discovery packets, to be polite to the network
 		self.stopDiscovery();
 		self.startDiscovery(10000);
@@ -138,33 +137,19 @@ Lifx.prototype.close = function() {
 Lifx.prototype._sendToOneOrAll = function(command, bulb) {
 	var self = this;
 	this.gateways.forEach(function(gw) {
-		var siteAddress = gw.site;
-		siteAddress.copy(command, 16);
-		if (typeof bulb == 'undefined') {
-			self._sendPacket(gw.ip, gw.port, command);
-		} else {
-			// Overwrite the bulb address here
+		gw.site.copy(command, 16);
+        // If a bulb is pecified. Send it to that one.
+		if (typeof bulb != 'undefined') {
 			var target;
-			if (Buffer.isBuffer(bulb)) {
-				target = bulb;
-			} else if (typeof bulb.addr != 'undefined') {
-				target = bulb.addr;
-			} else {
-				// Check if it's a recognised bulb name
-				var found = false;
-				self.bulbs.forEach(function(b) {
-					if (b.name == bulb) {
-						target = b.addr;
-						found = true;
-					}
-				});
-				if (!found) {
-					throw "Unknown bulb: " + bulb;
-				}
+			if (Buffer.isBuffer(bulb)) target = bulb;
+		    if (typeof bulb.addr != 'undefined') target = bulb.addr;
+            else { // Check if it's a recognised bulb name
+                if (self.bulbs[bulb]) target = b.addr;
+                else throw "Unknown bulb: " + bulb;
 			}
 			target.copy(command, 8);
-			self._sendPacket(gw.ip, gw.port, command);
 		}
+        self._sendPacket(gw.ip, gw.port, command);
 	});
 };
 
